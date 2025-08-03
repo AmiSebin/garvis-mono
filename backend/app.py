@@ -16,12 +16,18 @@ import math
 import cv2
 import base64
 import numpy as np
+import threading
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="하수도 막힘 감지 시스템 API", version="2.0.0")
+
+# 전역 상태 보호를 위한 Lock
+status_lock = threading.RLock()  # 재진입 가능한 Lock
+detections_lock = threading.RLock()
+clients_lock = threading.RLock()
 
 # CORS 설정 (프론트엔드 분리로 인해 필요)
 app.add_middleware(
@@ -380,64 +386,70 @@ def generate_detection_key(detection: DetectionData) -> str:
 def check_and_confirm_detections():
     """대기 중인 감지들을 확인하고 2초 지속된 것들을 확정"""
     global pending_detections
-    now = datetime.now()
-    
-    confirmed_keys = []
-    for key, detection_info in pending_detections.items():
-        first_detected = detection_info['first_detected']
-        time_diff = (now - first_detected).total_seconds()
-        
-        if time_diff >= CONFIRMATION_TIME_SECONDS:
-            # 2초 지속된 감지를 확정
-            confirmed_detection = detection_info['detection']
-            confirmed_detections.append(confirmed_detection)
-            confirmed_keys.append(key)
-            
-            logger.info(f"✅ 2초 지속 확정: {confirmed_detection.garbage_type} at {key}")
-            return confirmed_detection
-    
-    # 확정된 감지들을 대기 목록에서 제거
-    for key in confirmed_keys:
-        del pending_detections[key]
-    
-    return None
+
+    with detections_lock:
+        now = datetime.now()
+
+        confirmed_keys = []
+        for key, detection_info in pending_detections.items():
+            first_detected = detection_info['first_detected']
+            time_diff = (now - first_detected).total_seconds()
+
+            if time_diff >= CONFIRMATION_TIME_SECONDS:
+                # 2초 지속된 감지를 확정
+                confirmed_detection = detection_info['detection']
+                confirmed_detections.append(confirmed_detection)
+                confirmed_keys.append(key)
+
+                logger.info(f"✅ 2초 지속 확정: {confirmed_detection.garbage_type} at {key}")
+                return confirmed_detection
+
+        # 확정된 감지들을 대기 목록에서 제거
+        for key in confirmed_keys:
+            del pending_detections[key]
+
+        return None
 
 def add_to_pending_detections(detection: DetectionData):
     """새로운 감지를 대기 목록에 추가"""
     global pending_detections
-    key = generate_detection_key(detection)
-    now = datetime.now()
-    
-    if key not in pending_detections:
-        # 새로운 감지
-        pending_detections[key] = {
-            'detection': detection,
-            'first_detected': now,
-            'last_updated': now,
-            'count': 1
-        }
-        logger.debug(f"⏳ 새 감지 대기: {detection.garbage_type} at {key}")
-    else:
-        # 기존 감지 업데이트
-        pending_detections[key]['last_updated'] = now
-        pending_detections[key]['count'] += 1
-        pending_detections[key]['detection'] = detection  # 최신 데이터로 업데이트
-        logger.debug(f"🔄 감지 업데이트: {detection.garbage_type} at {key} (count: {pending_detections[key]['count']})")
+
+    with detections_lock:
+        key = generate_detection_key(detection)
+        now = datetime.now()
+
+        if key not in pending_detections:
+            # 새로운 감지
+            pending_detections[key] = {
+                'detection': detection,
+                'first_detected': now,
+                'last_updated': now,
+                'count': 1
+            }
+            logger.debug(f"⏳ 새 감지 대기: {detection.garbage_type} at {key}")
+        else:
+            # 기존 감지 업데이트
+            pending_detections[key]['last_updated'] = now
+            pending_detections[key]['count'] += 1
+            pending_detections[key]['detection'] = detection  # 최신 데이터로 업데이트
+            logger.debug(f"🔄 감지 업데이트: {detection.garbage_type} at {key} (count: {pending_detections[key]['count']})")
 
 def cleanup_old_pending_detections():
     """오래된 대기 감지들을 정리 (5초 이상 업데이트 없음)"""
     global pending_detections
-    now = datetime.now()
-    
-    old_keys = []
-    for key, detection_info in pending_detections.items():
-        time_since_update = (now - detection_info['last_updated']).total_seconds()
-        if time_since_update > 5.0:  # 5초 이상 업데이트 없음
-            old_keys.append(key)
-    
-    for key in old_keys:
-        logger.debug(f"🗑️ 오래된 대기 감지 제거: {key}")
-        del pending_detections[key]
+
+    with detections_lock:
+        now = datetime.now()
+
+        old_keys = []
+        for key, detection_info in pending_detections.items():
+            time_since_update = (now - detection_info['last_updated']).total_seconds()
+            if time_since_update > 5.0:  # 5초 이상 업데이트 없음
+                old_keys.append(key)
+
+        for key in old_keys:
+            logger.debug(f"🗑️ 오래된 대기 감지 제거: {key}")
+            del pending_detections[key]
 
 def is_duplicate_detection(new_detection: DetectionData, threshold_seconds: int = 10) -> bool:
     """중복 감지인지 확인"""
@@ -568,7 +580,8 @@ def is_valid_detection(detection: DetectionData) -> bool:
 
 def calculate_risk_score_with_ai(detections: List[DetectionData]) -> tuple[float, AIAnalysis]:
     """단순하고 효과적인 위험도 계산"""
-    current_risk = current_status.get("risk_score", 0)
+    with status_lock:
+        current_risk = current_status.get("risk_score", 0)
     
     # 최근 15초 이내의 감지만 사용 (실시간 반영 강화)
     now = datetime.now()
@@ -638,7 +651,7 @@ def calculate_risk_score_with_ai(detections: List[DetectionData]) -> tuple[float
     
     # 최종 점수 계산
     calculated_score = base_score + confidence_bonus + area_bonus + type_bonus
-    
+
     # 점진적 변화 적용 (급격한 변화 방지)
     if calculated_score > current_risk:
         # 증가 시: 차이의 70%만 반영
@@ -648,6 +661,8 @@ def calculate_risk_score_with_ai(detections: List[DetectionData]) -> tuple[float
         # 감소 시: 차이의 50%만 반영 (천천히 감소)
         change = (current_risk - calculated_score) * 0.5
         new_score = max(calculated_score, current_risk - change)
+
+    # 막힘 분석을 위해 status_lock 내에서 current_status 업데이트
     
     # AI 분석 생성 (단순화)
     if new_score >= 75:
@@ -754,18 +769,26 @@ def get_pipe_status(risk_level: str) -> str:
     return status_map.get(risk_level, "알 수 없음")
 
 def get_time_since_last_detection() -> float:
-    """마지막 감지로부터 경과 시간 (분)"""
-    if not recent_detections:
-        return 10.0  # 기본값: 10분
-    
-    try:
-        last_detection = recent_detections[-1]
-        last_time = datetime.fromisoformat(last_detection.timestamp.replace('Z', '+00:00'))
-        now = datetime.now()
-        time_diff = (now - last_time).total_seconds() / 60  # 분 단위
-        return max(0.1, time_diff)  # 최소 0.1분
-    except:
-        return 5.0  # 오류시 기본값
+    """마지막 감지로부터 경과 시간 (분) - 정확한 타임존 처리"""
+    with detections_lock:
+        if not recent_detections:
+            return 60.0  # 기본값: 60분 (감지가 전혀 없음)
+
+        try:
+            last_detection = recent_detections[-1]
+            last_time = datetime.fromisoformat(last_detection.timestamp.replace('Z', '+00:00'))
+
+            # 시간대 정보가 없으면 현재 시간대로 가정
+            if last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=datetime.now().astimezone().tzinfo)
+
+            now = datetime.now().astimezone()
+            time_diff = (now - last_time).total_seconds() / 60  # 분 단위
+
+            return max(0.0, time_diff)
+        except Exception as e:
+            logger.warning(f"시간 계산 오류: {e}")
+            return 10.0  # 오류시 기본값
 
 def calculate_dynamic_risk_change(detections: List[DetectionData], current_risk: float) -> float:
     """동적 위험도 변화 계산"""
@@ -845,10 +868,11 @@ def analyze_with_ai(detections: List[DetectionData], blockage_analysis: Blockage
     # AI 분석 로직
     risk_factors = []
     severity_score = 0.0
-    
+
     # 동적 변화 분석
-    current_risk = current_status.get("risk_score", 0)
-    previous_risk = current_status.get("previous_risk_score", current_risk)
+    with status_lock:
+        current_risk = current_status.get("risk_score", 0)
+        previous_risk = current_status.get("previous_risk_score", current_risk)
     risk_change = current_risk - previous_risk
     
     # 1. 막힘률 분석 (더 엄격하게)
@@ -991,10 +1015,11 @@ def analyze_with_ai(detections: List[DetectionData], blockage_analysis: Blockage
         recommendations.append("더 많은 데이터를 수집하여 분석 정확도를 높이세요.")
     
     # 동적 추세 분석
-    current_risk = current_status.get("risk_score", 0)
-    previous_risk = current_status.get("previous_risk_score", current_risk)
+    with status_lock:
+        current_risk = current_status.get("risk_score", 0)
+        previous_risk = current_status.get("previous_risk_score", current_risk)
     risk_change = current_risk - previous_risk
-    
+
     if risk_change > 5:
         trend_analysis = "급속 악화"
     elif risk_change > 2:
@@ -1007,9 +1032,10 @@ def analyze_with_ai(detections: List[DetectionData], blockage_analysis: Blockage
         trend_analysis = "안정"
     else:
         trend_analysis = "불안정"
-    
+
     # 이전 위험도 저장
-    current_status["previous_risk_score"] = current_risk
+    with status_lock:
+        current_status["previous_risk_score"] = current_risk
     
     return AIAnalysis(
         risk_assessment=risk_assessment,
@@ -1024,34 +1050,40 @@ def analyze_with_ai(detections: List[DetectionData], blockage_analysis: Blockage
 def update_status(detections_list: List[DetectionData]):
     """전역 상태 업데이트 (AI 분석 포함)"""
     risk_score, ai_analysis = calculate_risk_score_with_ai(detections_list)
-    current_status["risk_score"] = risk_score
-    current_status["risk_level"] = get_risk_level(risk_score)
-    current_status["pipe_status"] = get_pipe_status(current_status["risk_level"])
-    current_status["total_detections"] = len(detections_list)
-    current_status["ai_analysis"] = ai_analysis.model_dump()
-    
-    if detections_list:
-        current_status["last_detection"] = detections_list[-1].timestamp
-        current_status["accumulation_rate"] = len(detections_list)
+
+    with status_lock:
+        current_status["risk_score"] = risk_score
+        current_status["risk_level"] = get_risk_level(risk_score)
+        current_status["pipe_status"] = get_pipe_status(current_status["risk_level"])
+        current_status["total_detections"] = len(detections_list)
+        current_status["ai_analysis"] = ai_analysis.model_dump()
+
+        if detections_list:
+            current_status["last_detection"] = detections_list[-1].timestamp
+            current_status["accumulation_rate"] = len(detections_list)
 
 async def broadcast_to_clients(data: Dict[str, Any]):
     """WebSocket 브로드캐스트"""
-    if not connected_clients:
-        return
+    with clients_lock:
+        if not connected_clients:
+            return
+
+        clients_to_send = list(connected_clients)
 
     message = json.dumps(data, default=str)
     disconnected = []
 
-    for client in connected_clients:
+    for client in clients_to_send:
         try:
             await client.send_text(message)
         except Exception as e:
             logger.warning(f"클라이언트 전송 실패: {e}")
             disconnected.append(client)
 
-    for client in disconnected:
-        if client in connected_clients:
-            connected_clients.remove(client)
+    with clients_lock:
+        for client in disconnected:
+            if client in connected_clients:
+                connected_clients.remove(client)
 
 # ==================== API 엔드포인트 ====================
 
@@ -1081,31 +1113,40 @@ async def process_detection(data: DetectionData):
             }
 
         # 3단계: 즉시 recent_detections에 추가
-        recent_detections.append(data)
-        logger.info(f"🗑️ 즉시 감지: {data.garbage_type} (신뢰도: {data.confidence:.2f}, 면적: {data.area}, 총 감지: {len(recent_detections)})")
+        with detections_lock:
+            recent_detections.append(data)
+            detections_count = len(recent_detections)
+            detections_list = list(recent_detections)
+
+        logger.info(f"🗑️ 즉시 감지: {data.garbage_type} (신뢰도: {data.confidence:.2f}, 면적: {data.area}, 총 감지: {detections_count})")
 
         # 위험도 계산 전 로그
-        logger.info(f"🔍 위험도 계산 시작 - 현재 감지 수: {len(recent_detections)}")
+        logger.info(f"🔍 위험도 계산 시작 - 현재 감지 수: {detections_count}")
 
         # 4단계: 상태 업데이트
-        detections_list = list(recent_detections)
-        previous_risk_score = current_status.get("risk_score", 0)
+        with status_lock:
+            previous_risk_score = current_status.get("risk_score", 0)
+            previous_level = current_status.get("previous_level", "safe")
+
         update_status(detections_list)
 
-        previous_level = current_status.get("previous_level", "safe")
-        current_level = current_status["risk_level"]
-        current_status["previous_level"] = current_level
+        with status_lock:
+            current_level = current_status["risk_level"]
+            current_status["previous_level"] = current_level
+            current_risk_score = current_status["risk_score"]
 
         # 유의미한 변화 확인 (더 민감하게)
-        risk_change = abs(current_status["risk_score"] - previous_risk_score)
+        risk_change = abs(current_risk_score - previous_risk_score)
         significant_change = (risk_change >= 5.0) or (current_level != previous_level)  # 더 민감하게 조정
 
         # 알림 생성
         alert = None
         if current_level in ["warning", "caution", "danger"] and current_level != previous_level:
-            blockage_info = current_status.get("blockage_percentage", 0)
-            flow_restriction = current_status.get("flow_restriction", "알 수 없음")
-            garbage_volume = current_status.get("garbage_volume", 0)
+            with status_lock:
+                blockage_info = current_status.get("blockage_percentage", 0)
+                flow_restriction = current_status.get("flow_restriction", "알 수 없음")
+                garbage_volume = current_status.get("garbage_volume", 0)
+                risk_score_for_alert = current_status['risk_score']
 
             # 레벨별 메시지 구성
             if current_level == 'warning':
@@ -1123,49 +1164,60 @@ async def process_detection(data: DetectionData):
                 f"• 막힘률: {blockage_info}%\n"
                 f"• 흐름 제한: {flow_restriction}\n"
                 f"• 축적 쓰레기량: {garbage_volume}cm³\n"
-                f"• 위험도: {current_status['risk_score']:.2f}%"
+                f"• 위험도: {risk_score_for_alert:.2f}%"
             )
 
             alert = AlertData(
                 level=current_level,
                 message=detailed_message,
                 timestamp=datetime.now(),
-                risk_score=current_status['risk_score']
+                risk_score=risk_score_for_alert
             )
 
-            recent_alerts.appendleft(alert)
-            current_status["alerts_today"] += 1
+            with detections_lock:
+                recent_alerts.appendleft(alert)
+
+            with status_lock:
+                current_status["alerts_today"] += 1
+
             logger.warning(f"🚨 알림 발생: {detailed_message}")
 
         # 유의미한 변화시만 브로드캐스트
         if significant_change:
+            with status_lock:
+                status_copy = current_status.copy()
+
             broadcast_data = {
                 "type": "detection",
                 "data": data.model_dump(),
-                "status": current_status,
+                "status": status_copy,
                 "alert": alert.model_dump() if alert else None,
                 "blockage_analysis": {
-                    "blockage_percentage": current_status.get("blockage_percentage", 0),
-                    "garbage_volume": current_status.get("garbage_volume", 0),
-                    "flow_restriction": current_status.get("flow_restriction", "알 수 없음"),
-                    "accumulated_areas": current_status.get("accumulated_areas", 0)
+                    "blockage_percentage": status_copy.get("blockage_percentage", 0),
+                    "garbage_volume": status_copy.get("garbage_volume", 0),
+                    "flow_restriction": status_copy.get("flow_restriction", "알 수 없음"),
+                    "accumulated_areas": status_copy.get("accumulated_areas", 0)
                 },
-                "ai_analysis": current_status.get("ai_analysis", {})
+                "ai_analysis": status_copy.get("ai_analysis", {})
             }
 
             await broadcast_to_clients(broadcast_data)
 
         # 위험도 계산 후 로그
-        logger.info(f"📊 위험도 계산 완료 - 이전: {previous_risk_score:.2f}% → 현재: {current_status['risk_score']:.2f}% (변화: {risk_change:.2f}%)")
+        logger.info(f"📊 위험도 계산 완료 - 이전: {previous_risk_score:.2f}% → 현재: {current_risk_score:.2f}% (변화: {risk_change:.2f}%)")
+
+        with status_lock:
+            response_blockage = current_status.get("blockage_percentage", 0)
+            response_flow = current_status.get("flow_restriction", "알 수 없음")
 
         return {
             "success": True,
             "duplicate": False,
             "significant_change": significant_change,
-            "risk_score": current_status["risk_score"],
+            "risk_score": current_risk_score,
             "risk_level": current_level,
-            "blockage_percentage": current_status.get("blockage_percentage", 0),
-            "flow_restriction": current_status.get("flow_restriction", "알 수 없음"),
+            "blockage_percentage": response_blockage,
+            "flow_restriction": response_flow,
             "alert_created": alert is not None
         }
 
@@ -1176,31 +1228,38 @@ async def process_detection(data: DetectionData):
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
     """현재 시스템 상태 조회"""
-    return StatusResponse(**current_status)
+    with status_lock:
+        status_copy = current_status.copy()
+    return StatusResponse(**status_copy)
 
 @app.get("/blockage-analysis", response_model=BlockageAnalysis)
 async def get_blockage_analysis():
     """현재 하수구 막힘 분석 결과"""
-    detections_list = list(recent_detections)
+    with detections_lock:
+        detections_list = list(recent_detections)
     return analyze_pipe_blockage(detections_list)
 
 @app.get("/detections")
 async def get_recent_detections(limit: int = 20):
     """최근 감지 기록 조회"""
-    detections = list(recent_detections)[-limit:]
+    with detections_lock:
+        detections = list(recent_detections)[-limit:]
+        total = len(recent_detections)
     return {
         "detections": [d.model_dump() for d in detections],
-        "total": len(recent_detections),
+        "total": total,
         "limit": limit
     }
 
 @app.get("/alerts")
 async def get_recent_alerts(limit: int = 10):
     """최근 알림 조회"""
-    alerts = list(recent_alerts)[:limit]
+    with detections_lock:
+        alerts = list(recent_alerts)[:limit]
+        total = len(recent_alerts)
     return {
         "alerts": [a.model_dump() for a in alerts],
-        "total": len(recent_alerts),
+        "total": total,
         "limit": limit
     }
 
@@ -1209,28 +1268,31 @@ async def reset_system():
     """시스템 상태 초기화"""
     global current_status, pending_detections
 
-    recent_detections.clear()
-    recent_alerts.clear()
-    pending_detections.clear()  # 대기 중인 감지들도 초기화
-    confirmed_detections.clear()  # 확정된 감지들도 초기화
+    with detections_lock:
+        recent_detections.clear()
+        recent_alerts.clear()
+        pending_detections.clear()  # 대기 중인 감지들도 초기화
+        confirmed_detections.clear()  # 확정된 감지들도 초기화
 
-    current_status = {
-        "risk_score": 0.0,
-        "risk_level": "safe",
-        "total_detections": 0,
-        "last_detection": None,
-        "alerts_today": 0,
-        "pipe_status": "정상 - 원활한 흐름",
-        "accumulation_rate": 0.0,
-        "blockage_percentage": 0.0,
-        "garbage_volume": 0.0,
-        "flow_restriction": "없음",
-        "accumulated_areas": 0
-    }
+    with status_lock:
+        current_status = {
+            "risk_score": 0.0,
+            "risk_level": "safe",
+            "total_detections": 0,
+            "last_detection": None,
+            "alerts_today": 0,
+            "pipe_status": "정상 - 원활한 흐름",
+            "accumulation_rate": 0.0,
+            "blockage_percentage": 0.0,
+            "garbage_volume": 0.0,
+            "flow_restriction": "없음",
+            "accumulated_areas": 0
+        }
+        status_copy = current_status.copy()
 
     await broadcast_to_clients({
         "type": "reset",
-        "status": current_status
+        "status": status_copy
     })
 
     logger.info("🔄 시스템 초기화 완료 - 모든 감지 데이터 및 대기 상태 초기화")
@@ -1297,17 +1359,29 @@ async def websocket_endpoint(websocket: WebSocket):
     """실시간 데이터 스트리밍"""
     try:
         await websocket.accept()
-        connected_clients.append(websocket)
-        logger.info(f"새 클라이언트 연결. 총 연결: {len(connected_clients)}")
+
+        with clients_lock:
+            connected_clients.append(websocket)
+            client_count = len(connected_clients)
+
+        logger.info(f"새 클라이언트 연결. 총 연결: {client_count}")
 
         # 연결 즉시 현재 상태 전송
         try:
+            with status_lock:
+                status_copy = current_status.copy()
+                ai_analysis_copy = current_status.get("ai_analysis", {})
+
+            with detections_lock:
+                recent_detections_list = [d.model_dump() for d in list(recent_detections)[-5:]]
+                recent_alerts_list = [a.model_dump() for a in list(recent_alerts)[:3]]
+
             initial_data = {
                 "type": "initial",
-                "status": current_status,
-                "recent_detections": [d.model_dump() for d in list(recent_detections)[-5:]],
-                "recent_alerts": [a.model_dump() for a in list(recent_alerts)[:3]],
-                "ai_analysis": current_status.get("ai_analysis", {})
+                "status": status_copy,
+                "recent_detections": recent_detections_list,
+                "recent_alerts": recent_alerts_list,
+                "ai_analysis": ai_analysis_copy
             }
             await websocket.send_text(json.dumps(initial_data, default=str))
             logger.info("초기 데이터 전송 완료")
@@ -1347,21 +1421,29 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket 연결 오류: {e}")
     finally:
         # 정리 작업
-        if websocket in connected_clients:
-            connected_clients.remove(websocket)
-        logger.info(f"클라이언트 연결 정리 완료. 남은 연결: {len(connected_clients)}")
+        with clients_lock:
+            if websocket in connected_clients:
+                connected_clients.remove(websocket)
+            remaining_clients = len(connected_clients)
+        logger.info(f"클라이언트 연결 정리 완료. 남은 연결: {remaining_clients}")
 
 # ==================== 헬스체크 ====================
 
 @app.get("/health")
 async def health_check():
     """서버 상태 확인"""
+    with clients_lock:
+        client_count = len(connected_clients)
+
+    with detections_lock:
+        detection_count = len(recent_detections)
+
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "connected_clients": len(connected_clients),
+        "connected_clients": client_count,
         "camera_active": camera_active,
-        "total_detections": len(recent_detections),
+        "total_detections": detection_count,
         "version": "2.0.0"
     }
 
@@ -1372,45 +1454,50 @@ async def periodic_risk_update():
     while True:
         try:
             await asyncio.sleep(1.0)  # 1초마다 더 자주 실행
-            
+
             # 오래된 감지 데이터 정리 (5초 이상 된 것들로 더 빠르게)
             now = datetime.now()
             old_detections = []
-            for detection in list(recent_detections):
-                try:
-                    det_time = datetime.fromisoformat(detection.timestamp.replace('Z', '+00:00'))
-                    seconds_ago = (now - det_time).total_seconds()
-                    if seconds_ago > 5:  # 5초 이상 된 감지 (더 빠른 제거)
-                        old_detections.append(detection)
-                except:
-                    continue
-            
-            # 오래된 감지 제거
-            for old_detection in old_detections:
-                if old_detection in recent_detections:
-                    recent_detections.remove(old_detection)
-            
+
+            with detections_lock:
+                for detection in list(recent_detections):
+                    try:
+                        det_time = datetime.fromisoformat(detection.timestamp.replace('Z', '+00:00'))
+                        seconds_ago = (now - det_time).total_seconds()
+                        if seconds_ago > 5:  # 5초 이상 된 감지 (더 빠른 제거)
+                            old_detections.append(detection)
+                    except:
+                        continue
+
+                # 오래된 감지 제거
+                for old_detection in old_detections:
+                    if old_detection in recent_detections:
+                        recent_detections.remove(old_detection)
+
+                detections_list = list(recent_detections)
+
             # 주기적인 위험도 감소 (감지가 없어도 계속 감소)
-            previous_risk = current_status.get("risk_score", 0)
-            previous_level = current_status.get("risk_level", "safe")
-            
-            # 현재 감지 목록으로 위험도 재계산
-            detections_list = list(recent_detections)
-            
+            with status_lock:
+                previous_risk = current_status.get("risk_score", 0)
+                previous_level = current_status.get("risk_level", "safe")
+
             # 감지가 없고 위험도가 0보다 크면 자동 감소
             if not detections_list and previous_risk > 0:
                 # 더 적극적인 감소율 적용 (1초마다 2% 감소)
                 auto_decay_rate = 2.0
                 new_risk = max(0.0, previous_risk - auto_decay_rate)
-                current_status["risk_score"] = new_risk
-                current_status["risk_level"] = get_risk_level(new_risk)
-                current_status["pipe_status"] = get_pipe_status(current_status["risk_level"])
-                
+
+                with status_lock:
+                    current_status["risk_score"] = new_risk
+                    current_status["risk_level"] = get_risk_level(new_risk)
+                    current_status["pipe_status"] = get_pipe_status(current_status["risk_level"])
+                    status_copy = current_status.copy()
+
                 # 변화가 있으면 브로드캐스트
                 if new_risk != previous_risk:
                     broadcast_data = {
                         "type": "auto_decay",
-                        "status": current_status,
+                        "status": status_copy,
                         "message": f"쓰레기가 감지되지 않아 위험도가 자동으로 감소했습니다."
                     }
                     await broadcast_to_clients(broadcast_data)
@@ -1418,15 +1505,17 @@ async def periodic_risk_update():
             elif old_detections:
                 # 오래된 감지 제거로 인한 재계산
                 update_status(detections_list)
-                
-                current_level = current_status["risk_level"]
-                new_risk = current_status["risk_score"]
-                
+
+                with status_lock:
+                    current_level = current_status["risk_level"]
+                    new_risk = current_status["risk_score"]
+                    status_copy = current_status.copy()
+
                 # 위험도가 감소했거나 레벨이 변경되었을 때 브로드캐스트
                 if new_risk < previous_risk or current_level != previous_level:
                     broadcast_data = {
                         "type": "detection_removal",
-                        "status": current_status,
+                        "status": status_copy,
                         "message": f"오래된 쓰레기 감지가 제거되어 위험도가 업데이트되었습니다. ({len(old_detections)}개 제거)"
                     }
                     await broadcast_to_clients(broadcast_data)
@@ -1434,29 +1523,6 @@ async def periodic_risk_update():
 
         except Exception as e:
             logger.error(f"백그라운드 업데이트 오류: {e}")
-
-# ==================== 시간 계산 함수 수정 ====================
-
-def get_time_since_last_detection() -> float:
-    """마지막 감지로부터 경과 시간 (분) - 더 정확한 계산"""
-    if not recent_detections:
-        return 60.0  # 기본값: 60분 (감지가 전혀 없음)
-
-    try:
-        last_detection = recent_detections[-1]
-        last_time = datetime.fromisoformat(last_detection.timestamp.replace('Z', '+00:00'))
-
-        # 시간대 정보가 없으면 현재 시간대로 가정
-        if last_time.tzinfo is None:
-            last_time = last_time.replace(tzinfo=datetime.now().astimezone().tzinfo)
-
-        now = datetime.now().astimezone()
-        time_diff = (now - last_time).total_seconds() / 60  # 분 단위
-
-        return max(0.0, time_diff)
-    except Exception as e:
-        logger.warning(f"시간 계산 오류: {e}")
-        return 10.0  # 오류시 기본값
 
 # ==================== 애플리케이션 시작 이벤트 ====================
 
